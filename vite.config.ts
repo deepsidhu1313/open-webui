@@ -28,5 +28,27 @@ export default defineConfig({
 	},
 	esbuild: {
 		pure: process.env.ENV === 'dev' ? [] : ['console.log', 'console.debug', 'console.error']
+	},
+	server: {
+		proxy: {
+			'/api': {
+				target: 'http://localhost:8080',
+				changeOrigin: true,
+				timeout: 600000, // 10 minutes
+				proxyTimeout: 600000
+			},
+			'/ollama': {
+				target: 'http://localhost:8080',
+				changeOrigin: true,
+				timeout: 600000,
+				proxyTimeout: 600000
+			},
+			'/openai': {
+				target: 'http://localhost:8080',
+				changeOrigin: true,
+				timeout: 600000,
+				proxyTimeout: 600000
+			}
+		}
 	}
 });

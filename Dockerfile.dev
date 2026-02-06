@@ -1,0 +1,41 @@
+# Dockerfile.dev - For Local Backend Development
+# 1. Get pre-built frontend from official image
+FROM ghcr.io/open-webui/open-webui:main AS frontend-build
+
+# 2. Setup Dev Environment
+FROM python:3.11-bookworm
+
+# Install Node.js (kept for optional frontend dev)
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y nodejs build-essential && \
+    npm install -g npm@latest
+
+# Install other system dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    git pandoc gcc netcat-openbsd curl jq ffmpeg libsm6 libxext6 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy Pre-built Frontend (Fixes "Frontend build directory not found")
+COPY --from=frontend-build /app/build /app/build
+COPY --from=frontend-build /app/package.json /app/package.json
+
+# Install Python dependencies first (caching)
+COPY backend/requirements.txt /app/backend/requirements.txt
+RUN pip install --no-cache-dir -r /app/backend/requirements.txt
+
+# Create necessary directories
+RUN mkdir -p /app/backend/data
+
+# Expose ports for Frontend (3000) and Backend (8080)
+EXPOSE 3000
+EXPOSE 8080
+
+# Environment variables
+ENV PORT=8080
+ENV HOST=0.0.0.0
+
+# The command will be overridden by docker-compose, but providing a default
+CMD ["/bin/bash"]
