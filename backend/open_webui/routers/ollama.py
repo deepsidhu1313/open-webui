@@ -1,6 +1,6 @@
-# TODO: Implement a more intelligent load balancing mechanism for distributing requests among multiple backend instances.
-# Current implementation uses a simple round-robin approach (random.choice). Consider incorporating algorithms like weighted round-robin,
-# least connections, or least response time for better resource utilization and performance optimization.
+# Load balancing: Implemented least-connections algorithm that selects the backend server
+# with the fewest active requests. Uses Redis (if available) or in-memory tracking to monitor
+# active job counts per server. Falls back to random selection if load stats are unavailable.
 
 import asyncio
 import json
@@ -23,6 +23,13 @@ from open_webui.models.users import UserModel
 
 from open_webui.env import (
     ENABLE_FORWARD_USER_INFO_HEADERS,
+    REDIS_KEY_PREFIX,
+    OLLAMA_LB_ACTIVE_JOBS_WEIGHT,
+    OLLAMA_LB_RESPONSE_TIME_WEIGHT,
+    OLLAMA_HEALTH_CHECK_INTERVAL,
+    OLLAMA_HEALTH_CHECK_TIMEOUT,
+    OLLAMA_ALERT_RESPONSE_TIME_THRESHOLD_MS,
+    OLLAMA_ALERT_ACTIVE_JOBS_THRESHOLD,
     FORWARD_SESSION_INFO_HEADER_CHAT_ID,
 )
 
@@ -76,6 +83,234 @@ log = logging.getLogger(__name__)
 
 ##########################################
 #
+# Job Tracking
+#
+##########################################
+
+ACTIVE_JOB_STATS = {}
+PERFORMANCE_STATS = {}  # {base_url: {"avg_response_time": float, "sample_count": int}}
+HEALTH_STATUS = {}  # {base_url: {"status": "healthy" | "unhealthy", "last_check": timestamp}}
+
+
+async def check_server_health(base_url, timeout=OLLAMA_HEALTH_CHECK_TIMEOUT):
+    """
+    Check if a server is healthy by pinging its /api/version endpoint.
+    Returns True if healthy, False otherwise.
+    """
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{base_url}/api/version",
+                timeout=aiohttp.ClientTimeout(total=timeout),
+                ssl=AIOHTTP_CLIENT_SESSION_SSL,
+            ) as response:
+                return response.status == 200
+    except Exception as e:
+        log.debug(f"Health check failed for {base_url}: {e}")
+        return False
+
+
+async def update_health_status(base_url, is_healthy, request: Request = None):
+    """
+    Update the health status of a server in Redis or in-memory storage.
+    """
+    status = "healthy" if is_healthy else "unhealthy"
+    timestamp = time.time()
+    
+    if request and hasattr(request.app.state, "redis") and request.app.state.redis:
+        try:
+            key = f"health_status:{base_url}"
+            data = json.dumps({"status": status, "last_check": timestamp})
+            # TTL of 120 seconds (2x health check interval)
+            await request.app.state.redis.set(key, data, ex=120)
+        except Exception as e:
+            log.error(f"Redis error updating health status: {e}")
+            HEALTH_STATUS[base_url] = {"status": status, "last_check": timestamp}
+    else:
+        HEALTH_STATUS[base_url] = {"status": status, "last_check": timestamp}
+
+
+async def get_health_status(base_url, request: Request = None):
+    """
+    Get the health status of a server from Redis or in-memory storage.
+    Returns "healthy", "unhealthy", or "unknown".
+    """
+    if request and hasattr(request.app.state, "redis") and request.app.state.redis:
+        try:
+            key = f"health_status:{base_url}"
+            data = await request.app.state.redis.get(key)
+            if data:
+                status_data = json.loads(data)
+                return status_data.get("status", "unknown")
+        except Exception as e:
+            log.debug(f"Redis error reading health status: {e}")
+            return HEALTH_STATUS.get(base_url, {}).get("status", "unknown")
+    else:
+        return HEALTH_STATUS.get(base_url, {}).get("status", "unknown")
+
+
+async def update_active_job_count(url, delta=1, request: Request = None):
+    # Extract base URL to group endpoints provided by the same server
+    # e.g. http://localhost:11434/api/chat -> http://localhost:11434
+    try:
+        parsed_url = urlparse(url)
+        base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+    except Exception:
+        base_url = url
+
+    if request and hasattr(request.app.state, "redis") and request.app.state.redis:
+        try:
+            key = f"active_jobs:{base_url}"
+            if delta > 0:
+                await request.app.state.redis.incr(key, delta)
+            else:
+                # Decrement but don't go below 0
+                val = await request.app.state.redis.decr(key, -delta)
+                if val < 0:
+                     await request.app.state.redis.set(key, 0)
+        except Exception as e:
+            log.error(f"Redis error updating job count: {e}")
+    else:
+        # Fallback to in-memory matching
+        if base_url not in ACTIVE_JOB_STATS:
+            ACTIVE_JOB_STATS[base_url] = 0
+        ACTIVE_JOB_STATS[base_url] += delta
+        if ACTIVE_JOB_STATS[base_url] < 0:
+             ACTIVE_JOB_STATS[base_url] = 0
+        
+        # Check alert threshold (only when incrementing)
+        if delta > 0 and ACTIVE_JOB_STATS[base_url] > OLLAMA_ALERT_ACTIVE_JOBS_THRESHOLD:
+            log.warning(
+                f"Server {base_url} active jobs ({ACTIVE_JOB_STATS[base_url]}) "
+                f"exceeds threshold ({OLLAMA_ALERT_ACTIVE_JOBS_THRESHOLD})"
+            )
+
+
+async def update_response_time(url, response_time_ms, request: Request = None):
+    """
+    Update the moving average response time for a server.
+    Uses exponential moving average with alpha=0.3 (30% weight to new sample).
+    """
+    try:
+        parsed_url = urlparse(url)
+        base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+    except Exception:
+        base_url = url
+    
+    alpha = 0.3  # Weight for new sample (30% new, 70% historical)
+    
+    if request and hasattr(request.app.state, "redis") and request.app.state.redis:
+        try:
+            key = f"perf_avg_response_time:{base_url}"
+            count_key = f"perf_sample_count:{base_url}"
+            
+            # Get current average and count
+            current_avg = await request.app.state.redis.get(key)
+            current_avg = float(current_avg) if current_avg else 0.0
+            
+            count = await request.app.state.redis.get(count_key)
+            count = int(count) if count else 0
+            
+            # Calculate exponential moving average
+            if count == 0:
+                new_avg = response_time_ms
+            else:
+                new_avg = (alpha * response_time_ms) + ((1 - alpha) * current_avg)
+            
+            # Store updated values with 1 hour TTL
+            await request.app.state.redis.set(key, str(new_avg), ex=3600)
+            await request.app.state.redis.incr(count_key)
+            await request.app.state.redis.expire(count_key, 3600)
+            
+        except Exception as e:
+            log.debug(f"Redis error updating response time: {e}")
+            # Fallback to in-memory
+            _update_response_time_memory(base_url, response_time_ms, alpha)
+    else:
+        # In-memory fallback
+        _update_response_time_memory(base_url, response_time_ms, alpha)
+    
+    # Check alert thresholds
+
+    if response_time_ms > OLLAMA_ALERT_RESPONSE_TIME_THRESHOLD_MS:
+        log.warning(
+            f"Server {base_url} response time ({response_time_ms:.2f}ms) "
+            f"exceeds threshold ({OLLAMA_ALERT_RESPONSE_TIME_THRESHOLD_MS}ms)"
+        )
+
+
+async def update_token_stats(url, eval_count, eval_duration_nanos, request: Request = None):
+    """
+    Update the moving average tokens per second for a server.
+    """
+    try:
+        parsed_url = urlparse(url)
+        base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+    except Exception:
+        base_url = url
+    
+    # Calculate tokens per second (eval_duration is in nanoseconds)
+    if eval_duration_nanos <= 0:
+        return
+    
+    tokens_per_second = eval_count / (eval_duration_nanos / 1_000_000_000.0)
+    
+    # Check for reasonable bounds (e.g. 0.1 to 500 t/s) to filter outliers
+    if tokens_per_second < 0.1 or tokens_per_second > 1000:
+        return
+
+    alpha = 0.3  # Weight for new sample
+    
+    if request and hasattr(request.app.state, "redis") and request.app.state.redis:
+        try:
+            key = f"perf_avg_tokens_per_second:{base_url}"
+            
+            # Get current average
+            current_avg = await request.app.state.redis.get(key)
+            current_avg = float(current_avg) if current_avg else 0.0
+            
+            # Calculate exponential moving average
+            if current_avg == 0:
+                new_avg = tokens_per_second
+            else:
+                new_avg = (alpha * tokens_per_second) + ((1 - alpha) * current_avg)
+            
+            # Store updated values with 1 hour TTL
+            await request.app.state.redis.set(key, str(new_avg), ex=3600)
+            
+        except Exception as e:
+            log.debug(f"Redis error updating token stats: {e}")
+            _update_token_stats_memory(base_url, tokens_per_second, alpha)
+    else:
+        _update_token_stats_memory(base_url, tokens_per_second, alpha)
+
+
+def _update_token_stats_memory(base_url, tokens_per_second, alpha):
+    if base_url not in PERFORMANCE_STATS:
+        PERFORMANCE_STATS[base_url] = PERFORMANCE_STATS.get(base_url, {})
+        PERFORMANCE_STATS[base_url]["avg_tokens_per_second"] = tokens_per_second
+    else:
+        current_avg = PERFORMANCE_STATS[base_url].get("avg_tokens_per_second", 0.0)
+        if current_avg == 0:
+            new_avg = tokens_per_second
+        else:
+            new_avg = (alpha * tokens_per_second) + ((1 - alpha) * current_avg)
+        PERFORMANCE_STATS[base_url]["avg_tokens_per_second"] = new_avg
+
+
+def _update_response_time_memory(base_url, response_time_ms, alpha):
+    """Helper function for in-memory response time tracking."""
+    if base_url not in PERFORMANCE_STATS:
+        PERFORMANCE_STATS[base_url] = {"avg_response_time": response_time_ms, "sample_count": 1}
+    else:
+        current_avg = PERFORMANCE_STATS[base_url]["avg_response_time"]
+        new_avg = (alpha * response_time_ms) + ((1 - alpha) * current_avg)
+        PERFORMANCE_STATS[base_url]["avg_response_time"] = new_avg
+        PERFORMANCE_STATS[base_url]["sample_count"] += 1
+
+
+##########################################
+#
 # Utility functions
 #
 ##########################################
@@ -113,7 +348,21 @@ async def send_post_request(
     content_type: Optional[str] = None,
     user: UserModel = None,
     metadata: Optional[dict] = None,
+    request: Optional[Request] = None,
 ):
+    await update_active_job_count(url, 1, request)
+    decremented = False
+    start_time = time.time()  # Track request start time
+
+    async def decrement_counter():
+        nonlocal decremented
+        if not decremented:
+             await update_active_job_count(url, -1, request)
+             decremented = True
+             
+             # Record response time
+             response_time_ms = (time.time() - start_time) * 1000
+             await update_response_time(url, response_time_ms, request)
 
     r = None
     streaming = False
@@ -161,6 +410,41 @@ async def send_post_request(
             if content_type:
                 response_headers["Content-Type"] = content_type
 
+            async def stream_wrapper():
+                try:
+                    async for chunk in r.content.iter_any():
+                        yield chunk
+                        # Try to extract metrics from the chunk (usually the last one)
+                        try:
+                            # Iterate through potential multiple JSON objects in one chunk
+                            # This is a simple heuristic; robust parsing might be needed for complex cases
+                            # But Ollama usually sends clean JSON lines
+                            decoded = chunk.decode("utf-8", errors="ignore")
+                            # We search for the "done": true block which contains metrics
+                            if '"done":true' in decoded.replace(" ", ""):
+                                # Parse the last valid JSON object
+                                lines = decoded.strip().split("\n")
+                                for line in lines:
+                                    if '"done":true' in line.replace(" ", "") or '"done": true' in line:
+                                        data = json.loads(line)
+                                        if "eval_count" in data and "eval_duration" in data:
+                                            await update_token_stats(
+                                                url, 
+                                                data["eval_count"], 
+                                                data["eval_duration"], 
+                                                request
+                                            )
+                        except Exception:
+                            pass # Don't break stream on parsing error
+                finally:
+                    await cleanup_response(r, session)
+                    await decrement_counter()
+
+            return StreamingResponse(
+                stream_wrapper(),
+                status_code=r.status,
+                headers=response_headers,
+                background=None, # Background task moved to finally block of wrapper
             streaming = True
             return StreamingResponse(
                 stream_wrapper(r, session),
@@ -169,11 +453,19 @@ async def send_post_request(
             )
         else:
             res = await r.json()
+            await decrement_counter()
+            
+            # Non-streaming update
+            if "eval_count" in res and "eval_duration" in res:
+                await update_token_stats(url, res["eval_count"], res["eval_duration"], request)
+                
             return res
 
     except HTTPException as e:
+        await decrement_counter()
         raise e  # Re-raise HTTPException to be handled by FastAPI
     except Exception as e:
+        await decrement_counter()
         detail = f"Ollama: {e}"
 
         raise HTTPException(
@@ -181,6 +473,8 @@ async def send_post_request(
             detail=detail if e else "Open WebUI: Server Connection Error",
         )
     finally:
+        if not stream and r:
+             await cleanup_response(r, session)
         if not streaming:
             await cleanup_response(r, session)
 
@@ -207,6 +501,113 @@ router = APIRouter()
 async def get_status():
     return {"status": True}
 
+
+@router.get("/api/load-stats")
+async def get_load_stats(request: Request, user=Depends(get_admin_user)):
+    """
+    Get active job counts per Ollama backend server.
+    Returns a dictionary mapping server URLs to their active job counts.
+    """
+    stats = {}
+    
+    if not request.app.state.config.ENABLE_OLLAMA_API:
+        return stats
+    
+    for url in request.app.state.config.OLLAMA_BASE_URLS:
+        # Parse to get base URL
+        try:
+            parsed_url = urlparse(url)
+            base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+        except Exception:
+            base_url = url
+        
+        # Try to get from Redis first
+        if hasattr(request.app.state, "redis") and request.app.state.redis:
+            try:
+                key = f"active_jobs:{base_url}"
+                count = await request.app.state.redis.get(key)
+                stats[base_url] = int(count) if count else 0
+            except Exception as e:
+                log.error(f"Redis error reading job count: {e}")
+                stats[base_url] = ACTIVE_JOB_STATS.get(base_url, 0)
+        else:
+            # Fallback to in-memory
+            stats[base_url] = ACTIVE_JOB_STATS.get(base_url, 0)
+    
+    return stats
+
+
+@router.get("/api/server-stats")
+async def get_server_stats(request: Request, user=Depends(get_admin_user)):
+    """
+    Get comprehensive performance metrics per Ollama backend server.
+    Returns active job counts and average response times.
+    """
+    stats = {}
+    
+    if not request.app.state.config.ENABLE_OLLAMA_API:
+        return stats
+    
+    for url in request.app.state.config.OLLAMA_BASE_URLS:
+        # Parse to get base URL
+        try:
+            parsed_url = urlparse(url)
+            base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+        except Exception:
+            base_url = url
+        
+        # Get active jobs
+        active_jobs = 0
+        if hasattr(request.app.state, "redis") and request.app.state.redis:
+            try:
+                key = f"active_jobs:{base_url}"
+                count = await request.app.state.redis.get(key)
+                active_jobs = int(count) if count else 0
+            except Exception:
+                active_jobs = ACTIVE_JOB_STATS.get(base_url, 0)
+        else:
+            active_jobs = ACTIVE_JOB_STATS.get(base_url, 0)
+        
+        # Get average response time
+        avg_response_time = 0.0
+        sample_count = 0
+        if hasattr(request.app.state, "redis") and request.app.state.redis:
+            try:
+                time_key = f"perf_avg_response_time:{base_url}"
+                count_key = f"perf_sample_count:{base_url}"
+                token_key = f"perf_avg_tokens_per_second:{base_url}"
+                
+                avg_time = await request.app.state.redis.get(time_key)
+                avg_response_time = float(avg_time) if avg_time else 0.0
+                
+                count = await request.app.state.redis.get(count_key)
+                sample_count = int(count) if count else 0
+
+                avg_tokens = await request.app.state.redis.get(token_key)
+                avg_tokens_per_second = float(avg_tokens) if avg_tokens else 0.0
+            except Exception:
+                perf_data = PERFORMANCE_STATS.get(base_url, {})
+                avg_response_time = perf_data.get("avg_response_time", 0.0)
+                sample_count = perf_data.get("sample_count", 0)
+                avg_tokens_per_second = perf_data.get("avg_tokens_per_second", 0.0)
+        else:
+            perf_data = PERFORMANCE_STATS.get(base_url, {})
+            avg_response_time = perf_data.get("avg_response_time", 0.0)
+            sample_count = perf_data.get("sample_count", 0)
+            avg_tokens_per_second = perf_data.get("avg_tokens_per_second", 0.0)
+        
+        # Get health status
+        health_status = await get_health_status(base_url, request)
+        
+        stats[base_url] = {
+            "active_jobs": active_jobs,
+            "avg_response_time_ms": round(avg_response_time, 2),
+            "avg_tokens_per_second": round(avg_tokens_per_second, 2),
+            "sample_count": sample_count,
+            "health_status": health_status
+        }
+    
+    return stats
 
 class ConnectionVerificationForm(BaseModel):
     url: str
@@ -1228,6 +1629,7 @@ async def generate_completion(
         payload=form_data.model_dump_json(exclude_none=True).encode(),
         key=get_api_key(url_idx, url, request.app.state.config.OLLAMA_API_CONFIGS),
         user=user,
+        request=request,
     )
 
 
@@ -1273,7 +1675,99 @@ async def get_ollama_url(request: Request, model: str, url_idx: Optional[int] = 
                 status_code=400,
                 detail=ERROR_MESSAGES.MODEL_NOT_FOUND(model),
             )
-        url_idx = random.choice(models[model].get("urls", []))
+        
+        # Get candidate URLs for this model
+        candidate_urls = models[model].get("urls", [])
+        
+        if not candidate_urls:
+            raise HTTPException(
+                status_code=400,
+                detail=ERROR_MESSAGES.MODEL_NOT_FOUND(model),
+            )
+        
+        # Implement weighted load balancing (active jobs + response time)
+        min_score = float('inf')
+        best_url_idx = None
+        
+        # Collect metrics for all candidates first (for normalization)
+        server_metrics = []
+        for idx in candidate_urls:
+            url = request.app.state.config.OLLAMA_BASE_URLS[idx]
+            
+            # Extract base URL for load tracking
+            try:
+                parsed_url = urlparse(url)
+                base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+            except Exception:
+                base_url = url
+            
+            # Get current active jobs
+            current_load = 0
+            if hasattr(request.app.state, "redis") and request.app.state.redis:
+                try:
+                    key = f"active_jobs:{base_url}"
+                    count = await request.app.state.redis.get(key)
+                    current_load = int(count) if count else 0
+                except Exception as e:
+                    log.debug(f"Redis error reading job count for load balancing: {e}")
+                    current_load = ACTIVE_JOB_STATS.get(base_url, 0)
+            else:
+                current_load = ACTIVE_JOB_STATS.get(base_url, 0)
+            
+            # Get average response time
+            avg_response_time = 0.0
+            if hasattr(request.app.state, "redis") and request.app.state.redis:
+                try:
+                    key = f"perf_avg_response_time:{base_url}"
+                    avg_time = await request.app.state.redis.get(key)
+                    avg_response_time = float(avg_time) if avg_time else 0.0
+                except Exception as e:
+                    log.debug(f"Redis error reading response time for load balancing: {e}")
+                    avg_response_time = PERFORMANCE_STATS.get(base_url, {}).get("avg_response_time", 0.0)
+            else:
+                avg_response_time = PERFORMANCE_STATS.get(base_url, {}).get("avg_response_time", 0.0)
+            
+            # Check health status
+            health_status = await get_health_status(base_url, request)
+            
+            server_metrics.append({
+                "idx": idx,
+                "base_url": base_url,
+                "active_jobs": current_load,
+                "avg_response_time": avg_response_time,
+                "health_status": health_status
+            })
+        
+        # Filter out unhealthy servers
+        healthy_metrics = [m for m in server_metrics if m["health_status"] != "unhealthy"]
+        
+        # If all servers are unhealthy, use all servers (fallback)
+        if not healthy_metrics:
+            log.warning("All servers marked unhealthy, using all servers as fallback")
+            healthy_metrics = server_metrics
+        
+        # Calculate weighted score for each healthy server
+        # Lower score is better
+        for metrics in healthy_metrics:
+            # Use configurable weights from environment
+            active_jobs_weight = OLLAMA_LB_ACTIVE_JOBS_WEIGHT
+            response_time_weight = OLLAMA_LB_RESPONSE_TIME_WEIGHT
+            
+            # Score calculation
+            # Active jobs: direct count (lower is better)
+            # Response time: in milliseconds (lower is better)
+            score = (
+                active_jobs_weight * metrics["active_jobs"] +
+                response_time_weight * (metrics["avg_response_time"] / 1000.0)  # Convert ms to seconds for balance
+            )
+            
+            if score < min_score:
+                min_score = score
+                best_url_idx = metrics["idx"]
+        
+        # Use best server, fallback to random if none found
+        url_idx = best_url_idx if best_url_idx is not None else random.choice(candidate_urls)
+        
     url = request.app.state.config.OLLAMA_BASE_URLS[url_idx]
     return url, url_idx
 
@@ -1379,6 +1873,7 @@ async def generate_chat_completion(
         content_type="application/x-ndjson",
         user=user,
         metadata=metadata,
+        request=request,
     )
 
 
@@ -1490,6 +1985,7 @@ async def generate_openai_completion(
         key=get_api_key(url_idx, url, request.app.state.config.OLLAMA_API_CONFIGS),
         user=user,
         metadata=metadata,
+        request=request,
     )
 
 
@@ -1577,6 +2073,7 @@ async def generate_openai_chat_completion(
         key=get_api_key(url_idx, url, request.app.state.config.OLLAMA_API_CONFIGS),
         user=user,
         metadata=metadata,
+        request=request,
     )
 
 

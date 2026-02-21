@@ -1,0 +1,136 @@
+services:
+  # Create data directories
+  # mkdir -p data/{redis,ollama-1,ollama-2,open-webui,searxng,comfyui/{models,output,.cache}}
+  # Redis for shared state across workers (required for load balancing)
+  redis:
+    image: redis:alpine
+    container_name: redis
+    command: redis-server --appendonly yes --maxmemory 2gb --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    volumes:
+      - ./data/redis:/data
+    restart: unless-stopped
+
+  # Primary Ollama instance
+  ollama-1:
+    image: ollama/ollama:latest
+    container_name: ollama-1
+    ports:
+      - "11434:11434"
+    volumes:
+      - ./data/ollama:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  # Secondary Ollama instance for load balancing testing
+  ollama-2:
+    image: ollama/ollama:latest
+    container_name: ollama-2
+    ports:
+      - "11435:11434"
+    volumes:
+      - ./data/ollama-2:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  # Open-WebUI (Full Stack Dev Mode)
+  # - Builds from source
+  # - Runs 'npm run dev' for frontend (port 5173 -> 3000)
+  # - Runs backend separately
+  open-webui:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+      args:
+        OLLAMA_BASE_URL: '/ollama'
+    container_name: open-webui
+    # Override default command to run in dev mode
+    # We need to install dependencies if not present, then run dev
+    command: ["./dev_startup.sh"]
+    ports:
+      - "3000:8080"
+      # - "3000:3000" # Frontend UI
+      # - "8080:8080" # Backend API (required for frontend to connect)
+    volumes:
+      # Mount entire project for live editing
+      - .:/app:rw
+      - ./data/open-webui:/app/backend/data
+      # Exclude node_modules to avoid host/container mismatch
+      - /app/node_modules
+      - /app/backend/.venv
+    environment:
+      - 'OLLAMA_BASE_URLS=http://ollama-1:11434;http://ollama-2:11434'
+      - 'ENABLE_OLLAMA_API=true'
+      - 'REDIS_URL=redis://redis:6379'
+      - 'OLLAMA_LB_ACTIVE_JOBS_WEIGHT=0.5'
+      - 'OLLAMA_LB_RESPONSE_TIME_WEIGHT=0.5'
+      - 'OLLAMA_HEALTH_CHECK_INTERVAL=30'
+      - 'OLLAMA_HEALTH_CHECK_TIMEOUT=5'
+      - 'OLLAMA_ALERT_RESPONSE_TIME_THRESHOLD_MS=5000'
+      - 'OLLAMA_ALERT_ACTIVE_JOBS_THRESHOLD=10'
+      
+      # Timeouts (Keep connections open longer for slow models)
+      - 'AIOHTTP_CLIENT_TIMEOUT=600'
+      - 'OLLAMA_REQUEST_TIMEOUT=600'
+      - 'WEBUI_TIMEOUT=600'
+      
+      - 'ENABLE_API_KEY=true'
+      - 'WEBUI_SECRET_KEY=dev-secret-key-change-in-production'
+      - 'LOG_LEVEL=DEBUG'
+      # Frontend dev server config
+      - 'VITE_DEV_SERVER_PORT=3000'
+    depends_on:
+      - redis
+      - ollama-1
+      - ollama-2
+      - searxng
+    restart: unless-stopped
+    # Use host network for easier access if preferred, strictly mapped ports above
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # SearXNG for web search
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng
+    volumes:
+      - ./data/searxng:/etc/searxng:rw
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8088
+    ports:
+      - "8088:8080"
+    restart: unless-stopped
+
+  # ComfyUI (optional - comment out if not needed)
+  comfyui:
+    build:
+      context: ./comfyui
+    container_name: comfyui
+    command: --listen --lowvram --cpu-vae
+    ports:
+      - "8188:8188"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - ./data/comfyui/models:/app/ComfyUI/models
+      - ./data/comfyui/output:/app/ComfyUI/output
+      - ./data/comfyui/.cache:/app/ComfyUI/.cache
+    restart: unless-stopped

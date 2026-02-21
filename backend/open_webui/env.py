@@ -428,6 +428,28 @@ else:
         REDIS_RECONNECT_DELAY = None
 
 ####################################
+# LOAD BALANCING
+####################################
+
+# Weight for active jobs in load balancing score (0.0 to 1.0)
+OLLAMA_LB_ACTIVE_JOBS_WEIGHT = float(os.environ.get("OLLAMA_LB_ACTIVE_JOBS_WEIGHT", "0.5"))
+
+# Weight for response time in load balancing score (0.0 to 1.0)
+OLLAMA_LB_RESPONSE_TIME_WEIGHT = float(os.environ.get("OLLAMA_LB_RESPONSE_TIME_WEIGHT", "0.5"))
+
+# Health check interval in seconds
+OLLAMA_HEALTH_CHECK_INTERVAL = int(os.environ.get("OLLAMA_HEALTH_CHECK_INTERVAL", "30"))
+
+# Health check timeout in seconds
+OLLAMA_HEALTH_CHECK_TIMEOUT = int(os.environ.get("OLLAMA_HEALTH_CHECK_TIMEOUT", "5"))
+
+# Alert threshold for response time (milliseconds)
+OLLAMA_ALERT_RESPONSE_TIME_THRESHOLD_MS = int(os.environ.get("OLLAMA_ALERT_RESPONSE_TIME_THRESHOLD_MS", "5000"))
+
+# Alert threshold for active jobs
+OLLAMA_ALERT_ACTIVE_JOBS_THRESHOLD = int(os.environ.get("OLLAMA_ALERT_ACTIVE_JOBS_THRESHOLD", "10"))
+
+####################################
 # UVICORN WORKERS
 ####################################
 
