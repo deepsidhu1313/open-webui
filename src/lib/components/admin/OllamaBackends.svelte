@@ -66,20 +66,24 @@
 	{:else}
 		{#each Object.entries(stats) as [url, bStat]}
 			{@const healthy = bStat.health_status === 'healthy'}
+			{@const unhealthy = bStat.health_status === 'unhealthy'}
 			<div class="rounded-2xl p-6 bg-white dark:bg-gray-900 border border-gray-100 dark:border-gray-800 shadow-sm">
 				<!-- URL + health -->
 				<div class="flex items-center gap-3 mb-5">
 					<div class="relative flex-shrink-0">
 						<span
-							class="inline-block w-3 h-3 rounded-full {healthy ? 'bg-emerald-500' : 'bg-red-500'}"
+							class="inline-block w-3 h-3 rounded-full {healthy ? 'bg-emerald-500' : unhealthy ? 'bg-red-500' : 'bg-gray-400 dark:bg-gray-600'}"
 						/>
 						{#if healthy}
 							<span class="absolute inset-0 rounded-full bg-emerald-500 animate-ping opacity-50" />
 						{/if}
 					</div>
 					<span class="font-mono text-sm font-medium text-gray-800 dark:text-gray-200 truncate">{url}</span>
-					<span class="ml-auto text-xs px-2 py-0.5 rounded-full {healthy ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400' : 'bg-red-50 text-red-700 dark:bg-red-900/30 dark:text-red-400'}">
-						{bStat.health_status ?? 'unknown'}
+					<span class="ml-auto text-xs px-2 py-0.5 rounded-full
+						{healthy ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400'
+						: unhealthy ? 'bg-red-50 text-red-700 dark:bg-red-900/30 dark:text-red-400'
+						: 'bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400'}">
+						{healthy ? 'online' : unhealthy ? 'offline' : 'checking…'}
 					</span>
 				</div>
 

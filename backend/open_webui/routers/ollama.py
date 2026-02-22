@@ -567,50 +567,69 @@ async def get_load_stats(request: Request, user=Depends(get_admin_user)):
 async def get_server_stats(request: Request, user=Depends(get_admin_user)):
     """
     Get comprehensive performance metrics per Ollama backend server.
-    Returns active job counts and average response times.
+    Probes each backend with /api/version to keep health_status fresh.
     """
     stats = {}
-    
+
     if not request.app.state.config.ENABLE_OLLAMA_API:
         return stats
-    
+
+    import aiohttp as _aiohttp
+    import asyncio as _asyncio
+
+    async def _probe(base_url: str) -> bool:
+        try:
+            async with _aiohttp.ClientSession() as sess:
+                async with sess.get(
+                    f"{base_url}/api/version",
+                    timeout=_aiohttp.ClientTimeout(total=4),
+                    ssl=False,
+                ) as r:
+                    ok = r.status == 200
+                    await update_health_status(base_url, ok, request)
+                    return ok
+        except Exception:
+            await update_health_status(base_url, False, request)
+            return False
+
+    # Build base_url list and probe all backends concurrently
+    base_urls = []
     for url in request.app.state.config.OLLAMA_BASE_URLS:
-        # Parse to get base URL
         try:
             parsed_url = urlparse(url)
             base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
         except Exception:
             base_url = url
-        
-        # Get active jobs
+        base_urls.append(base_url)
+
+    await _asyncio.gather(*[_probe(u) for u in base_urls], return_exceptions=True)
+
+    for base_url in base_urls:
+        # Active jobs
         active_jobs = 0
         if hasattr(request.app.state, "redis") and request.app.state.redis:
             try:
-                key = f"active_jobs:{base_url}"
-                count = await request.app.state.redis.get(key)
+                count = await request.app.state.redis.get(f"active_jobs:{base_url}")
                 active_jobs = int(count) if count else 0
             except Exception:
                 active_jobs = ACTIVE_JOB_STATS.get(base_url, 0)
         else:
             active_jobs = ACTIVE_JOB_STATS.get(base_url, 0)
-        
-        # Get average response time
+
+        # Avg response time + tokens/s
         avg_response_time = 0.0
         sample_count = 0
+        avg_tokens_per_second = 0.0
         if hasattr(request.app.state, "redis") and request.app.state.redis:
             try:
-                time_key = f"perf_avg_response_time:{base_url}"
-                count_key = f"perf_sample_count:{base_url}"
-                token_key = f"perf_avg_tokens_per_second:{base_url}"
-                
-                avg_time = await request.app.state.redis.get(time_key)
+                avg_time = await request.app.state.redis.get(f"perf_avg_response_time:{base_url}")
                 avg_response_time = float(avg_time) if avg_time else 0.0
-                
-                count = await request.app.state.redis.get(count_key)
-                sample_count = int(count) if count else 0
 
-                avg_tokens = await request.app.state.redis.get(token_key)
-                avg_tokens_per_second = float(avg_tokens) if avg_tokens else 0.0
+                cnt = await request.app.state.redis.get(f"perf_sample_count:{base_url}")
+                sample_count = int(cnt) if cnt else 0
+
+                avg_tok = await request.app.state.redis.get(f"perf_avg_tokens_per_second:{base_url}")
+                avg_tokens_per_second = float(avg_tok) if avg_tok else 0.0
             except Exception:
                 perf_data = PERFORMANCE_STATS.get(base_url, {})
                 avg_response_time = perf_data.get("avg_response_time", 0.0)
@@ -621,11 +640,11 @@ async def get_server_stats(request: Request, user=Depends(get_admin_user)):
             avg_response_time = perf_data.get("avg_response_time", 0.0)
             sample_count = perf_data.get("sample_count", 0)
             avg_tokens_per_second = perf_data.get("avg_tokens_per_second", 0.0)
-        
-        # Get health status
+
+        # Health (now up-to-date after probing above)
         health_status = await get_health_status(base_url, request)
 
-        # Get total requests (persistent counter)
+        # Total requests counter
         total_requests = 0
         if hasattr(request.app.state, "redis") and request.app.state.redis:
             try:
@@ -644,8 +663,11 @@ async def get_server_stats(request: Request, user=Depends(get_admin_user)):
             "total_requests": total_requests,
             "health_status": health_status,
         }
-    
+
     return stats
+
+
+
 
 class ConnectionVerificationForm(BaseModel):
     url: str
