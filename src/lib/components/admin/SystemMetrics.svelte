@@ -2,7 +2,6 @@
 	import { onMount, onDestroy, getContext } from 'svelte';
 	import { user } from '$lib/stores';
 	import { getSystemMetrics } from '$lib/apis/system';
-	import BackendHistoryChart from './BackendHistoryChart.svelte';
 
 	const i18n = getContext('i18n');
 
@@ -127,10 +126,6 @@
 			</div>
 		</section>
 
-		<!-- B2: Backend History Charts -->
-		<section class="mt-2">
-			<BackendHistoryChart />
-		</section>
 	{:else}
 		<div class="flex flex-col items-center justify-center py-24 text-gray-400 dark:text-gray-600">
 			<p class="text-sm">{$i18n.t('Could not load system metrics')}</p>
