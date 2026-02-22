@@ -440,6 +440,7 @@ async def send_post_request(
                     await cleanup_response(r, session)
                     await decrement_counter()
 
+            streaming = True
             return StreamingResponse(
                 stream_wrapper(),
                 status_code=r.status,
@@ -467,9 +468,10 @@ async def send_post_request(
             detail=detail if e else "Open WebUI: Server Connection Error",
         )
     finally:
-        if not stream and r:
-             await cleanup_response(r, session)
-        if not streaming:
+        # Only clean up here for non-streaming responses.
+        # For streaming, cleanup is handled inside stream_wrapper's finally block
+        # to avoid closing the connection while it's still being iterated.
+        if not streaming and r:
             await cleanup_response(r, session)
 
 
