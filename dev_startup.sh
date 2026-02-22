@@ -10,26 +10,21 @@ cleanup() {
 trap cleanup SIGTERM SIGINT
 
 echo "🚀 Starting Open-WebUI Development Environment"
-echo "mode: Build-on-Start"
 
-# Fix git dubios ownership issues in container
+# Fix git dubious ownership issues in container
 git config --global --add safe.directory /app
 
-
-# 1. Build Frontend in Watch Mode
+# 1. Frontend
 echo "📦 [Frontend] Installing dependencies..."
 npm install --legacy-peer-deps
 
-echo "👀 [Frontend] Starting Build Watch Mode..."
-echo "   (Initial build may take a minute...)"
-# Run build:watch in background so backend can start
-npm run build
-# FRONTEND_PID=$!
-
-# Wait a bit for initial build to produce something (optional, but good for UX)
-# sleep 10
-
-echo "✅ [Frontend] Watch mode started. Updates will trigger rebuilds."
+if [ "${FORCE_BUILD}" = "true" ] || [ ! -d "build" ]; then
+    echo "🔨 [Frontend] Building... (set FORCE_BUILD=true to always rebuild)"
+    npm run build
+    echo "✅ [Frontend] Build complete."
+else
+    echo "⚡ [Frontend] Skipping build — 'build/' exists (FORCE_BUILD not set)."
+fi
 
 # 2. Install and Start Backend
 echo "🐍 [Backend] Installing Python dependencies..."
