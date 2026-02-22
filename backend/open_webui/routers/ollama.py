@@ -1984,8 +1984,10 @@ async def generate_chat_completion(
         payload["model"] = payload["model"].replace(f"{prefix_id}.", "")
 
     # Retry on 405/503: Ollama returns 405 while a model is still loading into VRAM.
-    # On those transient errors we failover to a different backend automatically.
-    tried_idxs = {url_idx}
+    # On those transient errors, failover to a different backend automatically.
+    tried_idxs: set = {url_idx}
+    last_exc: Optional[HTTPException] = None
+
     for attempt in range(2):
         try:
             return await send_post_request(
@@ -1999,29 +2001,51 @@ async def generate_chat_completion(
                 request=request,
             )
         except HTTPException as exc:
-            if exc.status_code in (405, 503) and attempt == 0:
-                log.warning(
-                    f"Backend {url} returned {exc.status_code} (model loading?); "
-                    f"retrying on a different backend."
-                )
-                # Temporarily boost load score so load balancer avoids this backend
-                await update_active_job_count(url, 5, request)
-                try:
-                    # Pick a fresh backend, excluding the failed one
-                    all_idxs = list(range(len(request.app.state.config.OLLAMA_BASE_URLS)))
-                    remaining = [i for i in all_idxs if i not in tried_idxs]
-                    if remaining:
-                        url_idx = remaining[0]
-                        url = request.app.state.config.OLLAMA_BASE_URLS[url_idx]
-                        tried_idxs.add(url_idx)
-                        api_config = request.app.state.config.OLLAMA_API_CONFIGS.get(
-                            str(url_idx),
-                            request.app.state.config.OLLAMA_API_CONFIGS.get(url, {}),
-                        )
-                        continue
-                except Exception:
-                    pass
-            raise exc
+            last_exc = exc
+            if exc.status_code not in (405, 503) or attempt > 0:
+                raise exc  # non-retriable or already retried once
+
+            # ── transient error on first attempt: find another backend ──
+            log.warning(
+                f"Backend {url} returned HTTP {exc.status_code} "
+                f"({'model loading' if exc.status_code == 405 else 'unavailable'}); "
+                f"attempting failover to another backend."
+            )
+
+            # Temporarily boost this backend's Redis score so LB avoids it
+            try:
+                base_url_failed = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
+                if hasattr(request.app.state, "redis") and request.app.state.redis:
+                    key = f"active_jobs:{base_url_failed}"
+                    cur = await request.app.state.redis.get(key)
+                    await request.app.state.redis.set(key, (int(cur) if cur else 0) + 5)
+                else:
+                    ACTIVE_JOB_STATS[base_url_failed] = ACTIVE_JOB_STATS.get(base_url_failed, 0) + 5
+            except Exception as boost_err:
+                log.debug(f"Could not boost load score for failover: {boost_err}")
+
+            # Pick the next untried backend index
+            all_idxs = list(range(len(request.app.state.config.OLLAMA_BASE_URLS)))
+            remaining = [i for i in all_idxs if i not in tried_idxs]
+            if not remaining:
+                log.warning("No alternative backend available for failover; raising original error.")
+                raise exc
+
+            url_idx = remaining[0]
+            url = request.app.state.config.OLLAMA_BASE_URLS[url_idx]
+            tried_idxs.add(url_idx)
+            api_config = request.app.state.config.OLLAMA_API_CONFIGS.get(
+                str(url_idx),
+                request.app.state.config.OLLAMA_API_CONFIGS.get(url, {}),
+            )
+            log.info(f"Failover: retrying request on backend {url}")
+            # loop continues to attempt == 1
+
+    # Should not reach here, but raise last exception just in case
+    if last_exc:
+        raise last_exc
+
+
 
 
 
