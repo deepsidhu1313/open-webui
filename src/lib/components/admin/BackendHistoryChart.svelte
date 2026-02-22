@@ -31,8 +31,9 @@
 	async function fetchSnapshots() {
 		if (!$user?.token) return;
 		try {
-			const params = new URLSearchParams({ limit: '72' }); // ~6 h of 5-min snapshots
-			if (selectedBackend) params.set('backend_url', selectedBackend);
+			// Always fetch ALL backends so the dropdown list stays complete.
+			// Filtering to a specific backend is done locally via activeSnaps.
+			const params = new URLSearchParams({ limit: '72' }); // ~6 h @ 5-min intervals
 			const res = await fetch(`/api/v1/system/snapshots?${params}`, {
 				headers: { Authorization: `Bearer ${$user.token}` }
 			});
@@ -99,7 +100,6 @@
 				<select
 					class="text-xs px-3 py-1.5 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 text-gray-700 dark:text-gray-300 outline-none"
 					bind:value={selectedBackend}
-					on:change={fetchSnapshots}
 				>
 					{#each backends as url}
 						<option value={url}>{url}</option>

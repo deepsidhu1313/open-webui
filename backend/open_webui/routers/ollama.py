@@ -163,6 +163,8 @@ async def update_active_job_count(url, delta=1, request: Request = None):
             key = f"active_jobs:{base_url}"
             if delta > 0:
                 await request.app.state.redis.incr(key, delta)
+                # Increment persistent total-requests counter
+                await request.app.state.redis.incr(f"total_requests:{base_url}")
             else:
                 # Decrement but don't go below 0
                 val = await request.app.state.redis.decr(key, -delta)
@@ -171,19 +173,24 @@ async def update_active_job_count(url, delta=1, request: Request = None):
         except Exception as e:
             log.error(f"Redis error updating job count: {e}")
     else:
-        # Fallback to in-memory matching
+        # Fallback to in-memory
         if base_url not in ACTIVE_JOB_STATS:
             ACTIVE_JOB_STATS[base_url] = 0
         ACTIVE_JOB_STATS[base_url] += delta
         if ACTIVE_JOB_STATS[base_url] < 0:
              ACTIVE_JOB_STATS[base_url] = 0
-        
-        # Check alert threshold (only when incrementing)
-        if delta > 0 and ACTIVE_JOB_STATS[base_url] > OLLAMA_ALERT_ACTIVE_JOBS_THRESHOLD:
-            log.warning(
-                f"Server {base_url} active jobs ({ACTIVE_JOB_STATS[base_url]}) "
-                f"exceeds threshold ({OLLAMA_ALERT_ACTIVE_JOBS_THRESHOLD})"
+
+        if delta > 0:
+            # Increment persistent total counter
+            PERFORMANCE_STATS.setdefault(base_url, {})
+            PERFORMANCE_STATS[base_url]["total_requests"] = (
+                PERFORMANCE_STATS[base_url].get("total_requests", 0) + 1
             )
+            if ACTIVE_JOB_STATS[base_url] > OLLAMA_ALERT_ACTIVE_JOBS_THRESHOLD:
+                log.warning(
+                    f"Server {base_url} active jobs ({ACTIVE_JOB_STATS[base_url]}) "
+                    f"exceeds threshold ({OLLAMA_ALERT_ACTIVE_JOBS_THRESHOLD})"
+                )
 
 
 async def update_response_time(url, response_time_ms, request: Request = None):
@@ -502,22 +509,46 @@ async def get_status():
 async def get_load_stats(request: Request, user=Depends(get_admin_user)):
     """
     Get active job counts per Ollama backend server.
-    Returns a dictionary mapping server URLs to their active job counts.
+    Also probes each backend with /api/version to keep health_status fresh.
     """
     stats = {}
-    
+
     if not request.app.state.config.ENABLE_OLLAMA_API:
         return stats
-    
+
+    import aiohttp as _aiohttp
+
+    async def _probe_health(base_url: str):
+        """Quick non-blocking health check — updates Redis/memory health_status."""
+        try:
+            async with _aiohttp.ClientSession() as sess:
+                async with sess.get(
+                    f"{base_url}/api/version",
+                    timeout=_aiohttp.ClientTimeout(total=4),
+                    ssl=False,
+                ) as r:
+                    await update_health_status(base_url, r.status == 200, request)
+                    return r.status == 200
+        except Exception:
+            await update_health_status(base_url, False, request)
+            return False
+
+    import asyncio as _asyncio
+    probe_tasks = []
+    base_urls = []
     for url in request.app.state.config.OLLAMA_BASE_URLS:
-        # Parse to get base URL
         try:
             parsed_url = urlparse(url)
             base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
         except Exception:
             base_url = url
-        
-        # Try to get from Redis first
+        base_urls.append(base_url)
+        probe_tasks.append(_probe_health(base_url))
+
+    # Run all health probes concurrently
+    await _asyncio.gather(*probe_tasks, return_exceptions=True)
+
+    for base_url in base_urls:
         if hasattr(request.app.state, "redis") and request.app.state.redis:
             try:
                 key = f"active_jobs:{base_url}"
@@ -527,9 +558,8 @@ async def get_load_stats(request: Request, user=Depends(get_admin_user)):
                 log.error(f"Redis error reading job count: {e}")
                 stats[base_url] = ACTIVE_JOB_STATS.get(base_url, 0)
         else:
-            # Fallback to in-memory
             stats[base_url] = ACTIVE_JOB_STATS.get(base_url, 0)
-    
+
     return stats
 
 
@@ -594,13 +624,25 @@ async def get_server_stats(request: Request, user=Depends(get_admin_user)):
         
         # Get health status
         health_status = await get_health_status(base_url, request)
-        
+
+        # Get total requests (persistent counter)
+        total_requests = 0
+        if hasattr(request.app.state, "redis") and request.app.state.redis:
+            try:
+                tr = await request.app.state.redis.get(f"total_requests:{base_url}")
+                total_requests = int(tr) if tr else 0
+            except Exception:
+                total_requests = PERFORMANCE_STATS.get(base_url, {}).get("total_requests", 0)
+        else:
+            total_requests = PERFORMANCE_STATS.get(base_url, {}).get("total_requests", 0)
+
         stats[base_url] = {
             "active_jobs": active_jobs,
             "avg_response_time_ms": round(avg_response_time, 2),
             "avg_tokens_per_second": round(avg_tokens_per_second, 2),
             "sample_count": sample_count,
-            "health_status": health_status
+            "total_requests": total_requests,
+            "health_status": health_status,
         }
     
     return stats

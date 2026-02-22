@@ -305,7 +305,9 @@ async def _snapshot_loop(app) -> None:
                                     loaded_models = len(models)
                                     vram_gb = round(
                                         sum(
-                                            m.get("size_vram", 0)
+                                            # On Apple Silicon, size_vram=0 (unified memory).
+                                            # Fall back to total model size in that case.
+                                            m.get("size_vram") or m.get("size", 0)
                                             for m in models
                                         ) / 1_073_741_824,
                                         2,
