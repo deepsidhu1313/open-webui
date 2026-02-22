@@ -25,6 +25,12 @@
 		return `${ms?.toFixed(0) ?? '—'}ms`;
 	}
 
+	function fmtGb(bytes: number) {
+		if (!bytes) return '';
+		const gb = bytes / 1_073_741_824;
+		return gb >= 1 ? `${gb.toFixed(1)} GB` : `${(bytes / 1_048_576).toFixed(0)} MB`;
+	}
+
 	onMount(async () => {
 		await fetchStats();
 		loading = false;
@@ -122,6 +128,40 @@
 								class="h-full rounded-full transition-all duration-700 {gaugeColor(pctFill)}"
 								style="width: {pctFill}%"
 							/>
+						</div>
+					</div>
+				{/if}
+				<!-- Available Models -->
+				{@const loadedNames = new Set((bStat.loaded_models ?? []).map((m: any) => m.name))}
+				{#if (bStat.available_models ?? []).length > 0}
+					<div class="mt-4 pt-4 border-t border-gray-100 dark:border-gray-800">
+						<p class="text-xs font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wide mb-2">
+							{$i18n.t('Available Models')} ({bStat.available_models.length})
+						</p>
+						<div class="flex flex-wrap gap-2">
+							{#each bStat.available_models as m}
+								{@const isLoaded = loadedNames.has(m.name)}
+								<div class="flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs
+									{isLoaded
+										? 'bg-emerald-50 dark:bg-emerald-900/20 border border-emerald-200 dark:border-emerald-800'
+										: 'bg-gray-50 dark:bg-gray-800 border border-gray-100 dark:border-gray-700'}">
+									{#if isLoaded}
+										<span class="w-1.5 h-1.5 rounded-full bg-emerald-500 flex-shrink-0" />
+									{/if}
+									<span class="font-medium {isLoaded ? 'text-emerald-700 dark:text-emerald-400' : 'text-gray-700 dark:text-gray-300'}">{m.name}</span>
+									{#if m.parameter_size}
+										<span class="text-gray-400 dark:text-gray-500">{m.parameter_size}</span>
+									{/if}
+									{#if m.quantization_level}
+										<span class="text-gray-300 dark:text-gray-600">·</span>
+										<span class="text-gray-400 dark:text-gray-500">{m.quantization_level}</span>
+									{/if}
+									{#if m.size}
+										<span class="text-gray-300 dark:text-gray-600">·</span>
+										<span class="text-gray-400 dark:text-gray-500">{fmtGb(m.size)}</span>
+									{/if}
+								</div>
+							{/each}
 						</div>
 					</div>
 				{/if}

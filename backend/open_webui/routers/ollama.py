@@ -577,22 +577,66 @@ async def get_server_stats(request: Request, user=Depends(get_admin_user)):
     import aiohttp as _aiohttp
     import asyncio as _asyncio
 
-    async def _probe(base_url: str) -> bool:
+    async def _fetch_backend(base_url: str) -> dict:
+        """Concurrently probe health, fetch available models, and fetch loaded models."""
+        result = {"healthy": False, "available_models": [], "loaded_models": []}
         try:
             async with _aiohttp.ClientSession() as sess:
-                async with sess.get(
+                version_task = sess.get(
                     f"{base_url}/api/version",
                     timeout=_aiohttp.ClientTimeout(total=4),
                     ssl=False,
-                ) as r:
+                )
+                tags_task = sess.get(
+                    f"{base_url}/api/tags",
+                    timeout=_aiohttp.ClientTimeout(total=6),
+                    ssl=False,
+                )
+                ps_task = sess.get(
+                    f"{base_url}/api/ps",
+                    timeout=_aiohttp.ClientTimeout(total=6),
+                    ssl=False,
+                )
+
+                async with version_task as r:
                     ok = r.status == 200
                     await update_health_status(base_url, ok, request)
-                    return ok
-        except Exception:
-            await update_health_status(base_url, False, request)
-            return False
+                    result["healthy"] = ok
 
-    # Build base_url list and probe all backends concurrently
+                async with tags_task as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        result["available_models"] = [
+                            {
+                                "name": m.get("name", m.get("model", "")),
+                                "size": m.get("size", 0),
+                                "parameter_size": m.get("details", {}).get("parameter_size", ""),
+                                "quantization_level": m.get("details", {}).get("quantization_level", ""),
+                                "family": m.get("details", {}).get("family", ""),
+                            }
+                            for m in data.get("models", [])
+                        ]
+
+                async with ps_task as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        result["loaded_models"] = [
+                            {
+                                "name": m.get("name", m.get("model", "")),
+                                # On Apple Silicon size_vram=0; fall back to total model size
+                                "vram_gb": round(
+                                    (m.get("size_vram") or m.get("size", 0)) / 1_073_741_824, 2
+                                ),
+                                "expires_at": m.get("expires_at", ""),
+                            }
+                            for m in data.get("models", [])
+                        ]
+        except Exception as e:
+            log.debug(f"Backend probe failed for {base_url}: {e}")
+            await update_health_status(base_url, False, request)
+        return result
+
+    # Build base_url list and fetch all backends concurrently
     base_urls = []
     for url in request.app.state.config.OLLAMA_BASE_URLS:
         try:
@@ -602,7 +646,15 @@ async def get_server_stats(request: Request, user=Depends(get_admin_user)):
             base_url = url
         base_urls.append(base_url)
 
-    await _asyncio.gather(*[_probe(u) for u in base_urls], return_exceptions=True)
+    backend_data = await _asyncio.gather(
+        *[_fetch_backend(u) for u in base_urls], return_exceptions=True
+    )
+    # Map base_url -> fetched data (default to empty on exception)
+    backend_info = {
+        base_urls[i]: (backend_data[i] if isinstance(backend_data[i], dict) else {})
+        for i in range(len(base_urls))
+    }
+
 
     for base_url in base_urls:
         # Active jobs
@@ -655,6 +707,7 @@ async def get_server_stats(request: Request, user=Depends(get_admin_user)):
         else:
             total_requests = PERFORMANCE_STATS.get(base_url, {}).get("total_requests", 0)
 
+        binfo = backend_info.get(base_url, {})
         stats[base_url] = {
             "active_jobs": active_jobs,
             "avg_response_time_ms": round(avg_response_time, 2),
@@ -662,6 +715,8 @@ async def get_server_stats(request: Request, user=Depends(get_admin_user)):
             "sample_count": sample_count,
             "total_requests": total_requests,
             "health_status": health_status,
+            "available_models": binfo.get("available_models", []),
+            "loaded_models": binfo.get("loaded_models", []),
         }
 
     return stats
