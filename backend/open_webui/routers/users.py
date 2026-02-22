@@ -703,3 +703,38 @@ async def get_user_groups_by_id(
     user_id: str, user=Depends(get_admin_user), db: Session = Depends(get_session)
 ):
     return Groups.get_groups_by_member_id(user_id, db=db)
+
+
+############################
+# UpdateUserJobPriorityById
+############################
+
+
+class UserJobPriorityForm(BaseModel):
+    priority: int  # 1 (lowest) to 10 (highest)
+
+
+@router.patch("/{user_id}/job-priority", response_model=Optional[UserModel])
+async def update_user_job_priority(
+    user_id: str,
+    form_data: UserJobPriorityForm,
+    session_user=Depends(get_admin_user),
+    db: Session = Depends(get_session),
+):
+    """
+    Admin-only: set a user's job-queue scheduling priority (1–10, default 5).
+    Higher values mean the user's jobs are dispatched first by the scheduler.
+    """
+    if not 1 <= form_data.priority <= 10:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Priority must be between 1 and 10.",
+        )
+    updated = Users.update_user_job_priority_by_id(user_id, form_data.priority, db=db)
+    if updated:
+        return updated
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail=ERROR_MESSAGES.USER_NOT_FOUND,
+    )
+

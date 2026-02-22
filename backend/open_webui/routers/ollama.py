@@ -441,12 +441,6 @@ async def send_post_request(
                     await decrement_counter()
 
             return StreamingResponse(
-                stream_wrapper(),
-                status_code=r.status,
-                headers=response_headers,
-                background=None, # Background task moved to finally block of wrapper
-            streaming = True
-            return StreamingResponse(
                 stream_wrapper(r, session),
                 status_code=r.status,
                 headers=response_headers,

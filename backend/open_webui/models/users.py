@@ -18,6 +18,7 @@ from open_webui.utils.validate import validate_profile_image_url
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 from sqlalchemy import (
     BigInteger,
+    Integer,
     JSON,
     Column,
     String,
@@ -77,6 +78,9 @@ class User(Base):
     updated_at = Column(BigInteger)
     created_at = Column(BigInteger)
 
+    # Job queue priority — admin-managed, 1 (lowest) to 10 (highest), default 5
+    job_priority = Column(Integer, nullable=False, server_default="5")
+
 
 class UserModel(BaseModel):
     id: str
@@ -109,6 +113,9 @@ class UserModel(BaseModel):
     last_active_at: int  # timestamp in epoch
     updated_at: int  # timestamp in epoch
     created_at: int  # timestamp in epoch
+
+    # Job queue priority (1–10, default 5, admin-managed)
+    job_priority: int = 5
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -707,6 +714,13 @@ class UsersTable:
 
         except Exception:
             return None
+
+    def update_user_job_priority_by_id(
+        self, id: str, priority: int, db: Optional[Session] = None
+    ) -> Optional[UserModel]:
+        """Set the job-queue priority for a user (admin-managed, range 1–10)."""
+        priority = max(1, min(10, priority))
+        return self.update_user_by_id(id, {"job_priority": priority}, db=db)
 
     def update_user_by_id(
         self, id: str, updated: dict, db: Optional[Session] = None

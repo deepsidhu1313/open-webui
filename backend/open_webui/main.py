@@ -74,6 +74,7 @@ from open_webui.routers import (
     analytics,
     audio,
     images,
+    jobs,
     ollama,
     openai,
     retrieval,
@@ -98,6 +99,7 @@ from open_webui.routers import (
     users,
     utils,
     scim,
+    system,
 )
 
 from open_webui.routers.retrieval import (
@@ -640,6 +642,10 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(periodic_usage_pool_cleanup())
     asyncio.create_task(periodic_session_pool_cleanup())
 
+    # Start the priority-based async job scheduler
+    from open_webui.utils.job_scheduler import start_scheduler
+    await start_scheduler(app)
+
     if app.state.config.ENABLE_BASE_MODELS_CACHE:
         try:
             await get_all_models(
@@ -692,6 +698,9 @@ async def lifespan(app: FastAPI):
 
     if hasattr(app.state, "redis_task_command_listener"):
         app.state.redis_task_command_listener.cancel()
+
+    from open_webui.utils.job_scheduler import stop_scheduler
+    await stop_scheduler()
 
 
 app = FastAPI(
@@ -1503,6 +1512,8 @@ app.include_router(users.router, prefix="/api/v1/users", tags=["users"])
 app.include_router(channels.router, prefix="/api/v1/channels", tags=["channels"])
 app.include_router(chats.router, prefix="/api/v1/chats", tags=["chats"])
 app.include_router(notes.router, prefix="/api/v1/notes", tags=["notes"])
+app.include_router(jobs.router, prefix="/api/v1/jobs", tags=["jobs"])
+app.include_router(system.router, prefix="/api/v1/system", tags=["system"])
 
 
 app.include_router(models.router, prefix="/api/v1/models", tags=["models"])

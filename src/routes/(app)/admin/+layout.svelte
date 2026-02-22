@@ -60,7 +60,7 @@
 						class="flex gap-1 scrollbar-none overflow-x-auto w-fit text-center text-sm font-medium rounded-full bg-transparent pt-1"
 					>
 						<a
-							class="min-w-fit p-1.5 {$page.url.pathname.includes('/admin/users')
+							class="min-w-fit p-1.5 {$page.url.pathname === '/admin' || $page.url.pathname.startsWith('/admin/users')
 								? ''
 								: 'text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'} transition"
 							href="/admin">{$i18n.t('Users')}</a
@@ -92,6 +92,34 @@
 								? ''
 								: 'text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'} transition"
 							href="/admin/settings">{$i18n.t('Settings')}</a
+						>
+
+						<a
+							class="min-w-fit p-1.5 {$page.url.pathname === '/admin/jobs' && !$page.url.pathname.includes('/analytics')
+								? ''
+								: 'text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'} transition"
+							href="/admin/jobs">{$i18n.t('Jobs')}</a
+						>
+
+						<a
+							class="min-w-fit p-1.5 {$page.url.pathname.includes('/admin/jobs/analytics')
+								? ''
+								: 'text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'} transition"
+							href="/admin/jobs/analytics">{$i18n.t('Job Analytics')}</a
+						>
+
+						<a
+							class="min-w-fit p-1.5 {$page.url.pathname.includes('/admin/backends')
+								? ''
+								: 'text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'} transition"
+							href="/admin/backends">{$i18n.t('Backends')}</a
+						>
+
+						<a
+							class="min-w-fit p-1.5 {$page.url.pathname.includes('/admin/system')
+								? ''
+								: 'text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'} transition"
+							href="/admin/system">{$i18n.t('System')}</a
 						>
 					</div>
 				</div>

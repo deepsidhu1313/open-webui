@@ -550,3 +550,33 @@ export const getUserGroupsById = async (token: string, userId: string) => {
 
 	return res;
 };
+
+/**
+ * Admin-only: update the job-queue scheduling priority for a user.
+ * priority must be an integer between 1 (low) and 10 (high).
+ */
+export const updateUserJobPriority = async (token: string, userId: string, priority: number) => {
+	let error = null;
+
+	const res = await fetch(`${WEBUI_API_BASE_URL}/users/${userId}/job-priority`, {
+		method: 'PATCH',
+		headers: {
+			'Content-Type': 'application/json',
+			Authorization: `Bearer ${token}`
+		},
+		body: JSON.stringify({ priority })
+	})
+		.then(async (r) => {
+			if (!r.ok) throw await r.json();
+			return r.json();
+		})
+		.catch((err) => {
+			console.error(err);
+			error = err?.detail ?? err;
+			return null;
+		});
+
+	if (error) throw error;
+	return res;
+};
+

@@ -6,7 +6,7 @@
 
 	import { goto } from '$app/navigation';
 
-	import { updateUserById, getUserGroupsById } from '$lib/apis/users';
+	import { updateUserById, getUserGroupsById, updateUserJobPriority } from '$lib/apis/users';
 
 	import Modal from '$lib/components/common/Modal.svelte';
 	import localizedFormat from 'dayjs/plugin/localizedFormat';
@@ -41,6 +41,12 @@
 		email: '',
 		password: ''
 	};
+
+	let jobPriority: number = 5;
+
+	$: if (selectedUser) {
+		jobPriority = selectedUser.job_priority ?? 5;
+	}
 
 	let userGroups: any[] | null = null;
 
@@ -147,6 +153,34 @@
 												<option value="user">{$i18n.t('User')}</option>
 												<option value="pending">{$i18n.t('Pending')}</option>
 											</select>
+										</div>
+									</div>
+
+									<!-- Job Priority -->
+									<div class="flex flex-col w-full">
+										<div class="mb-1 text-xs text-gray-500 flex items-center justify-between">
+											<span>{$i18n.t('Job Priority')} <span class="text-gray-400">(1–10)</span></span>
+											<button
+												type="button"
+												class="text-xs text-blue-500 hover:underline"
+												on:click={async () => {
+													const p = Math.max(1, Math.min(10, Math.round(jobPriority)));
+													const res = await updateUserJobPriority(localStorage.token, selectedUser.id, p).catch((e) => {
+														toast.error(`${e}`);
+														return null;
+													});
+													if (res) toast.success($i18n.t('Job priority updated'));
+												}}
+											>{$i18n.t('Apply')}</button>
+										</div>
+										<div class="flex items-center gap-2">
+											<input
+												type="range"
+												min="1" max="10" step="1"
+												bind:value={jobPriority}
+												class="flex-1 accent-blue-500"
+											/>
+											<span class="text-sm font-medium w-5 text-center text-gray-700 dark:text-gray-300">{jobPriority}</span>
 										</div>
 									</div>
 

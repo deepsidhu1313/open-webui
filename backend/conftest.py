@@ -67,6 +67,7 @@ MOCK_MODULES = [
     "passlib.hash",
     "aiohttp", 
     "requests",
+    "loguru",
     "itsdangerous",
 ]
 
